@@ -136,36 +136,46 @@ float psnr_metric(const torch::Tensor& rendered_img, const torch::Tensor& gt_img
 }
 
 int main(int argc, char* argv[]) {
+    // ------------- 1. 准备工作 -------------
+    // 将命令行参数转换为字符串列表
     std::vector<std::string> args;
     args.reserve(argc);
-
     for (int i = 0; i < argc; ++i) {
         args.emplace_back(argv[i]);
     }
+
+
+    // 读取和解析模型参数和优化参数
     // TODO: read parameters from JSON file or command line
     auto modelParams = gs::param::ModelParameters();
     auto optimParams = gs::param::read_optim_params_from_json();
     if (parse_cmd_line_args(args, modelParams, optimParams) < 0) {
-        return -1;
+        return -1; // 参数解析失败时退出
     };
+    // 将模型参数写入到指定的输出文件
     Write_model_parameters_to_file(modelParams);
 
+    // ------------- 2. 创建高斯模型和场景 -------------
     auto gaussians = GaussianModel(modelParams.sh_degree);
     auto scene = Scene(gaussians, modelParams);
     gaussians.Training_setup(optimParams);
+    // 检查CUDA是否可用
     if (!torch::cuda::is_available()) {
         // At the moment, I want to make sure that my GPU is utilized.
         std::cout << "CUDA is not available! Training on CPU." << std::endl;
-        exit(-1);
+        exit(-1); // CUDA不可用时退出
     }
+
+    // 设置背景色和渲染窗口
     auto pointType = torch::TensorOptions().dtype(torch::kFloat32);
     auto background = modelParams.white_background ? torch::tensor({1.f, 1.f, 1.f}) : torch::tensor({0.f, 0.f, 0.f}, pointType).to(torch::kCUDA);
-
     const int window_size = 11;
     const int channel = 3;
     const auto conv_window = gaussian_splatting::create_window(window_size, channel).to(torch::kFloat32).to(torch::kCUDA, true);
     const int camera_count = scene.Get_camera_count();
 
+
+    // ------------- 3. 主训练循环 -------------
     std::vector<int> indices;
     int last_status_len = 0;
     auto start_time = std::chrono::steady_clock::now();
@@ -177,23 +187,28 @@ int main(int argc, char* argv[]) {
     float psnr_value = 0.f;
     for (int iter = 1; iter < optimParams.iterations + 1; ++iter) {
         if (indices.empty()) {
-            indices = get_random_indices(camera_count);
+            indices = get_random_indices(camera_count); // 随机选择一个相机进行训练
         }
         const int camera_index = indices.back();
         auto& cam = scene.Get_training_camera(camera_index);
         auto gt_image = cam.Get_original_image().to(torch::kCUDA, true);
         indices.pop_back(); // remove last element to iterate over all cameras randomly
+        
+        // 每1000次迭代升级SH阶数
         if (iter % 1000 == 0) {
             gaussians.One_up_sh_degree();
         }
-        // Render
+
+        // ------------- 3.1 前向传播 -------------
+        // Render 渲染
         auto [image, viewspace_point_tensor, visibility_filter, radii] = render(cam, gaussians, background);
 
-        // Loss Computations
+        // Loss Computations 计算损失
         auto l1l = gaussian_splatting::l1_loss(image, gt_image);
         auto ssim_loss = gaussian_splatting::ssim(image, gt_image, conv_window, window_size, channel);
         auto loss = (1.f - optimParams.lambda_dssim) * l1l + optimParams.lambda_dssim * (1.f - ssim_loss);
 
+        // 每100次迭代，更新状态
         // Update status line
         if (iter % 100 == 0) {
             auto cur_time = std::chrono::steady_clock::now();
@@ -223,19 +238,29 @@ int main(int argc, char* argv[]) {
             last_status_len = curlen;
         }
 
+        // ------------- 3.2 反向传播 -------------
+        // 早停（early_stopping），使用LossMonitor更新平均收敛率（avg_converging_rate）。这通常是为了在损失值不再显著下降时提前停止训练。
         if (optimParams.early_stopping) {
+            // 更新平均收敛率，用于早停判断
             avg_converging_rate = loss_monitor.Update(loss.item<float>());
         }
         loss_add += loss.item<float>();
+        // 反向传播
         loss.backward();
 
+
+        // 梯度更新与模型调整
         {
+            // 暂停梯度计算，用于参数更新后的处理
             torch::NoGradGuard no_grad;
+
+            // 更新高斯模型的最大半径参数
             auto visible_max_radii = gaussians._max_radii2D.masked_select(visibility_filter);
             auto visible_radii = radii.masked_select(visibility_filter);
             auto max_radii = torch::max(visible_max_radii, visible_radii);
             gaussians._max_radii2D.masked_scatter_(visibility_filter, max_radii);
 
+            // 如果达到迭代次数上限，保存模型并计算PSNR值
             if (iter == optimParams.iterations) {
                 std::cout << std::endl;
                 gaussians.Save_ply(modelParams.output_path, iter, true);
@@ -243,30 +268,33 @@ int main(int argc, char* argv[]) {
                 break;
             }
 
+            // 每7000次迭代保存一次模型状态（gaussian splatting原文的7000一个节点）
             if (iter % 7'000 == 0) {
                 gaussians.Save_ply(modelParams.output_path, iter, false);
             }
 
-            // Densification
+            // Densification: 在特定迭代范围内调整模型的密度
             if (iter < optimParams.densify_until_iter) {
                 gaussians.Add_densification_stats(viewspace_point_tensor, visibility_filter);
                 if (iter > optimParams.densify_from_iter && iter % optimParams.densification_interval == 0) {
-                    // @TODO: Not sure about type
+                    // TODO: Not sure about type
                     float size_threshold = iter > optimParams.opacity_reset_interval ? 20.f : -1.f;
                     gaussians.Densify_and_prune(optimParams.densify_grad_threshold, optimParams.min_opacity, scene.Get_cameras_extent(), size_threshold);
                 }
-
+                // 重置不透明度参数
                 if (iter % optimParams.opacity_reset_interval == 0 || (modelParams.white_background && iter == optimParams.densify_from_iter)) {
                     gaussians.Reset_opacity();
                 }
             }
 
+            // 检查是否满足早停条件
             if (iter >= optimParams.densify_until_iter && loss_monitor.IsConverging(optimParams.convergence_threshold)) {
                 std::cout << "Converged after " << iter << " iterations!" << std::endl;
                 gaussians.Save_ply(modelParams.output_path, iter, true);
                 break;
             }
 
+            // 优化器步骤：更新模型参数并重置梯度
             //  Optimizer step
             if (iter < optimParams.iterations) {
                 gaussians._optimizer->step();
@@ -275,12 +303,15 @@ int main(int argc, char* argv[]) {
                 gaussians.Update_learning_rate(iter);
             }
 
+            // 清空CUDA缓存以减少VRAM使用
             if (optimParams.empty_gpu_cache && iter % 100) {
                 c10::cuda::CUDACachingAllocator::emptyCache();
             }
         }
     }
 
+
+    // 训练结束
     auto cur_time = std::chrono::steady_clock::now();
     std::chrono::duration<double> time_elapsed = cur_time - start_time;
 

@@ -31,6 +31,7 @@ message(STATUS "Building with ${used_cores} out of ${total_cores} available core
 # Files
 # --------------------------------------
 
+# 设置头文件列表。这些文件通常包含类的声明和模板的定义。
 set(HEADERS
         includes/read_utils.cuh
         includes/gaussian.cuh
@@ -60,6 +61,7 @@ set(HEADERS
         cuda_rasterizer/serialization.h
 )
 
+# 设置源代码
 set(SOURCES
         src/main.cu
         src/read_utils.cu
@@ -78,6 +80,7 @@ set(SOURCES
         cuda_rasterizer/rasterizer_impl.cu
 )
 
+# 针对src/utils.cu中来自stb_image.h的警告进行抑制
 # Get rid of pesky warnings from stb_image.h produced in src/utils.cu
 set_source_files_properties(src/utils.cu PROPERTIES COMPILE_FLAGS "-Xcudafe --diag_suppress=550 ")
 
@@ -85,8 +88,10 @@ set_source_files_properties(src/utils.cu PROPERTIES COMPILE_FLAGS "-Xcudafe --di
 # Project target
 # --------------------------------------
 
+# 创建可执行文件，包含上面定义的源文件和头文件
 add_executable(${PROJECT_NAME} ${SOURCES} ${HEADERS})
 
+# 设置项目目标的属性，指定CUDA和C++的标准
 set_target_properties(${PROJECT_NAME} PROPERTIES
         CUDA_ARCHITECTURES native
         CUDA_STANDARD 17
@@ -95,12 +100,15 @@ set_target_properties(${PROJECT_NAME} PROPERTIES
         CXX_STANDARD_REQUIRED ON
 )
 
+# 包含头文件目录
 target_include_directories(${PROJECT_NAME} PRIVATE ${PROJECT_SOURCE_DIR}/includes ${PROJECT_SOURCE_DIR}/cuda_rasterizer ${PROJECT_SOURCE_DIR}/external/tinyply/source)
 
+# Torch（深度学习库）设置
 # Torch setup
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${TORCH_CXX_FLAGS}")
 find_package(Torch REQUIRED)
 
+# 根据CMAKE_BUILD_TYPE设置构建选项
 # Build options based on CMAKE_BUILD_TYPE
 function(configure_build_type)
     if (CMAKE_BUILD_TYPE STREQUAL "Debug")
@@ -115,11 +123,13 @@ function(configure_build_type)
 endfunction()
 configure_build_type()
 
+# 查找所需的包
 # Required packages
 find_package(CUDAToolkit REQUIRED)
 find_package(TBB REQUIRED)
 find_package(Threads REQUIRED)
 
+# 检查CUDA版本
 # Check CUDA version
 if (CUDAToolkit_VERSION VERSION_LESS "11.7")
     message(FATAL_ERROR "This project requires CUDA 11.7 or higher")
@@ -137,6 +147,7 @@ add_subdirectory(external)
 # Linking
 # --------------------------------------
 
+# 指定链接到项目的库
 target_link_libraries(${PROJECT_NAME}
         PRIVATE
         ${TORCH_LIBRARIES}
@@ -151,6 +162,14 @@ target_link_libraries(${PROJECT_NAME}
         Threads::Threads
         args
 )
+
+
+
+
+
+
+
+
 
 # --------------------------------------
 # Add googletest
